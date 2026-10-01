@@ -1,0 +1,374 @@
+import os
+import json
+import time
+import threading
+from datetime import datetime, timezone, timedelta
+from flask import Flask, render_template_string
+import telebot
+
+# ----------------------------------------------------
+# 1. CẤU HÌNH BOT & MÚI GIỜ VIỆT NAM (UTC+7)
+# ----------------------------------------------------
+# THAY TOKEN BOTFATHER CỦA BẠN VÀO GIỮA 2 DẤU NGOẶC KÉP:
+TELEGRAM_TOKEN = "8740631835:AAHR2caeJ2EbliCiD_0v5_2TVWoz3A0fWNw"
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
+
+VN_TZ = timezone(timedelta(hours=7))
+DATA_FILE = "tiktok_data.json"
+MEMBERS = ["DƯƠNG T", "DƯƠNG", "LONG", "XUÂN", "PHƯƠNG", "KHÁNH"]
+
+AUTO_REPORT_HOUR = 23
+AUTO_REPORT_MINUTE = 59
+
+def get_vn_now():
+    return datetime.now(VN_TZ)
+
+def load_data():
+    default_data = {
+        "members": MEMBERS,
+        "rates": {"dnt": 110, "tha": 130},
+        "months": {},
+        "group_chat_ids": [],
+        "last_auto_report_date": ""
+    }
+    if not os.path.exists(DATA_FILE):
+        return default_data
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            for key, val in default_data.items():
+                if key not in data:
+                    data[key] = val
+            return data
+    except Exception:
+        return default_data
+
+def save_data(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def register_chat_id(chat_id):
+    data = load_data()
+    if chat_id not in data["group_chat_ids"]:
+        data["group_chat_ids"].append(chat_id)
+        save_data(data)
+
+def add_coin_record(member_name, coin_type, amount, day=None, month=None):
+    now = get_vn_now()
+    if not day: day = str(now.day)
+    else: day = str(day)
+    if not month: month = str(now.month)
+    else: month = str(month)
+
+    data = load_data()
+    
+    matched_name = None
+    for m in data["members"]:
+        if m.lower() == member_name.lower():
+            matched_name = m
+            break
+    if not matched_name:
+        matched_name = member_name.upper()
+        data["members"].append(matched_name)
+
+    if month not in data["months"]:
+        data["months"][month] = {}
+    if day not in data["months"][month]:
+        data["months"][month][day] = {}
+    if matched_name not in data["months"][month][day]:
+        data["months"][month][day][matched_name] = {"dnt": 0, "tha": 0}
+
+    data["months"][month][day][matched_name][coin_type] += amount
+    save_data(data)
+    
+    current_val = data["months"][month][day][matched_name][coin_type]
+    return matched_name, day, month, current_val
+
+def build_daily_report(day, month):
+    data = load_data()
+    day_data = data.get("months", {}).get(str(month), {}).get(str(day), {})
+
+    if not day_data:
+        return None
+
+    msg = f"📊 <b>BÁO CÁO TỔNG KẾT NGÀY {day}/{month}</b>\n"
+    msg += "───────────────────\n"
+    total_dnt = total_tha = 0
+
+    for name, coins in day_data.items():
+        cdnt = coins.get("dnt", 0)
+        ctha = coins.get("tha", 0)
+        if cdnt > 0 or ctha > 0:
+            total_dnt += cdnt
+            total_tha += ctha
+            msg += f"• <b>{name}</b>: DNT {cdnt:,} | Thả {ctha:,}\n"
+
+    rate_dnt = data["rates"]["dnt"]
+    rate_tha = data["rates"]["tha"]
+    total_money = (total_dnt * rate_dnt) + (total_tha * rate_tha)
+
+    msg += "───────────────────\n"
+    msg += f"🎁 <b>Tổng Xu DNT:</b> {total_dnt:,} xu ({total_dnt * rate_dnt:,.0f} đ)\n"
+    msg += f"🪂 <b>Tổng Xu Thả:</b> {total_tha:,} xu ({total_tha * rate_tha:,.0f} đ)\n"
+    msg += f"💰 <b>TỔNG THỰC NHẬN:</b> <b>{total_money:,.0f} VNĐ</b>\n"
+    msg += f"🕒 <i>Tự động chốt lúc {get_vn_now().strftime('%H:%M:%S')}</i>"
+    return msg
+
+# ----------------------------------------------------
+# 2. XỬ LÝ LỆNH TELEGRAM
+# ----------------------------------------------------
+@bot.message_handler(commands=['start', 'help'])
+def send_help(message):
+    register_chat_id(message.chat.id)
+    help_text = (
+        "🤖 <b>BOT BÁO XU TIKTOK TỰ ĐỘNG</b>\n\n"
+        "📌 <b>Cú pháp báo xu:</b>\n"
+        "<code>&lt;Tên&gt; &lt;Số xu&gt; &lt;Loại&gt;</code>\n\n"
+        "💡 <b>Ví dụ:</b>\n"
+        "• <code>Khánh 1500 dnt</code>\n"
+        "• <code>Dương 800 tha</code>\n"
+        "• <code>Xuân 2000 dnt 12</code> (báo bù cho ngày 12)\n\n"
+        f"⏰ <b>Chốt ca tự động:</b> Đúng {AUTO_REPORT_HOUR:02d}:{AUTO_REPORT_MINUTE:02d} mỗi tối bot sẽ tự chốt và gửi bảng vào nhóm!"
+    )
+    bot.reply_to(message, help_text, parse_mode="HTML")
+
+@bot.message_handler(commands=['tong'])
+def manual_total(message):
+    register_chat_id(message.chat.id)
+    now = get_vn_now()
+    report = build_daily_report(now.day, now.month)
+    if report:
+        bot.reply_to(message, report, parse_mode="HTML")
+    else:
+        bot.reply_to(message, f"📅 Hôm nay (Ngày {now.day}/{now.month}) chưa phát sinh số liệu nào.")
+
+@bot.message_handler(func=lambda msg: True)
+def handle_message(message):
+    register_chat_id(message.chat.id)
+    text = message.text.strip().lower()
+    parts = text.split()
+
+    if len(parts) < 3:
+        return
+
+    name = parts[0]
+    try:
+        coins = int(parts[1].replace(',', '').replace('.', ''))
+    except ValueError:
+        return
+
+    type_str = parts[2]
+    if "dnt" in type_str or "don" in type_str:
+        c_type = "dnt"
+        type_name = "Xu Donate"
+    elif "tha" in type_str:
+        c_type = "tha"
+        type_name = "Xu Thả"
+    else:
+        return
+
+    custom_day = None
+    if len(parts) >= 4 and parts[3].isdigit():
+        custom_day = int(parts[3])
+
+    try:
+        real_name, day, month, current_val = add_coin_record(name, c_type, coins, day=custom_day)
+        bot.reply_to(
+            message,
+            f"✅ <b>Đã nhận:</b> {real_name} (+{coins:,} {type_name})\n"
+            f"📅 Ngày {day}/{month} | Tổng hiện tại: <b>{current_val:,} xu</b>",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        bot.reply_to(message, f"❌ Lỗi: {str(e)}")
+
+# ----------------------------------------------------
+# 3. LUỒNG TỰ ĐỘNG CHỐT SỔ HÀNG ĐÊM
+# ----------------------------------------------------
+def auto_scheduler_loop():
+    while True:
+        try:
+            now = get_vn_now()
+            today_str = f"{now.day:02d}_{now.month:02d}_{now.year}"
+
+            if now.hour == AUTO_REPORT_HOUR and now.minute == AUTO_REPORT_MINUTE:
+                data = load_data()
+                if data.get("last_auto_report_date") != today_str:
+                    report = build_daily_report(now.day, now.month)
+                    if report and data.get("group_chat_ids"):
+                        for cid in data["group_chat_ids"]:
+                            try:
+                                bot.send_message(cid, f"🔔 <b>[TỰ ĐỘNG CHỐT SỔ NGÀY]</b>\n\n{report}", parse_mode="HTML")
+                            except Exception as err:
+                                print(f"Không gửi được đến chat_id {cid}: {err}")
+
+                    data["last_auto_report_date"] = today_str
+                    save_data(data)
+
+            time.sleep(30)
+        except Exception as e:
+            print(f"Lỗi scheduler: {e}")
+            time.sleep(30)
+
+# ----------------------------------------------------
+# 4. GIAO DIỆN WEB
+# ----------------------------------------------------
+app = Flask(__name__)
+
+WEB_HTML = """
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bảng Quản Lý Xu TikTok</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0b0f19; color: #f1f5f9; font-family: -apple-system, BlinkMacSystemFont, sans-serif; padding: 10px; }
+    .header { background: #151d30; padding: 12px; border-radius: 12px; margin-bottom: 10px; border: 1px solid #1e293b; }
+    .title { font-size: 16px; font-weight: bold; color: #38bdf8; }
+    .stat-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
+    .card { background: #151d30; border: 1px solid #1e293b; border-radius: 10px; padding: 10px; }
+    .card-val { font-size: 16px; font-weight: bold; font-family: monospace; margin-top: 2px; }
+    .card-full { grid-column: span 2; background: linear-gradient(135deg, #064e3b, #0f172a); border-color: #059669; }
+    .tbl-box { width: 100%; overflow-x: auto; max-height: 65vh; border-radius: 12px; border: 1px solid #1e293b; background: #151d30; }
+    table { border-collapse: separate; border-spacing: 0; width: max-content; min-width: 100%; font-size: 11px; text-align: center; }
+    th, td { border-right: 1px solid #1e293b; border-bottom: 1px solid #1e293b; padding: 6px 8px; white-space: nowrap; font-family: monospace; }
+    .sticky-col { position: sticky; left: 0; z-index: 10; background: #1e293b !important; color: #facc15 !important; font-weight: bold; }
+    .h1-th { position: sticky; top: 0; z-index: 15; }
+    .h2-th { position: sticky; top: 29px; z-index: 15; }
+    .btn-ref { padding: 6px 12px; background: #0284c7; color: white; border: none; border-radius: 8px; font-size: 11px; font-weight: bold; cursor: pointer; float: right; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <button class="btn-ref" onclick="location.reload()">🔄 Cập nhật</button>
+    <div class="title">📊 Bảng Xu TikTok Online</div>
+    <div style="font-size: 11px; color: #94a3b8;">Tháng {{ current_month }} • Tự động chốt ca 23:59 mỗi tối</div>
+  </div>
+
+  <div class="stat-row">
+    <div class="card card-full">
+      <div style="font-size: 10px; color: #6ee7b7; font-weight: bold;">TỔNG TIỀN VNĐ CẢ ĐỘI</div>
+      <div class="card-val" style="color: #34d399; font-size: 18px;">{{ "{:,.0f}".format(total_all_money) }} đ</div>
+      <div style="font-size: 10px; color: #94a3b8;">{{ "{:,}".format(total_all_coins) }} xu tổng</div>
+    </div>
+    <div class="card">
+      <div style="font-size: 10px; color: #facc15; font-weight: bold;">XU DNT</div>
+      <div class="card-val" style="color: #facc15;">{{ "{:,}".format(total_m_dnt) }}</div>
+      <div style="font-size: 10px; color: #64748b;">{{ "{:,.0f}".format(total_m_dnt * rates['dnt']) }} đ</div>
+    </div>
+    <div class="card">
+      <div style="font-size: 10px; color: #34d399; font-weight: bold;">XU THẢ</div>
+      <div class="card-val" style="color: #34d399;">{{ "{:,}".format(total_m_tha) }}</div>
+      <div style="font-size: 10px; color: #64748b;">{{ "{:,.0f}".format(total_m_tha * rates['tha']) }} đ</div>
+    </div>
+  </div>
+
+  <div class="tbl-box">
+    <table>
+      <thead>
+        <tr class="h1-th">
+          <th rowspan="2" class="sticky-col" style="background: #dc2626 !important; color: white !important;">NGÀY</th>
+          {% for mem in members %}
+            <th colspan="2" style="background: {{ loop.index % 2 == 0 and '#e2e8f0' or '#facc15' }}; color: black; font-weight: 900;">{{ mem }}</th>
+          {% endfor %}
+          <th colspan="2" style="background: #eab308; color: black; font-weight: 900;">TỔNG NGÀY</th>
+        </tr>
+        <tr class="h2-th">
+          {% for mem in members %}
+            <th style="background: #090d16; color: #facc15;">XU DNT</th>
+            <th style="background: #064e3b; color: #6ee7b7;">XU THẢ</th>
+          {% endfor %}
+          <th style="background: #090d16; color: #facc15;">XU DNT</th>
+          <th style="background: #064e3b; color: #6ee7b7;">XU THẢ</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for day in range(1, 32) %}
+          <tr>
+            <td class="sticky-col">{{ day }}</td>
+            {% for mem in members %}
+              {% set rec = month_data.get(day|string, {}).get(mem, {'dnt': 0, 'tha': 0}) %}
+              <td style="color: {{ rec.dnt > 0 and '#fff' or '#64748b' }};">{{ rec.dnt }}</td>
+              <td style="color: {{ rec.tha > 0 and '#34d399' or '#64748b' }}; background: rgba(6,78,59,0.15);">{{ rec.tha }}</td>
+            {% endfor %}
+            <td style="font-weight: bold; color: #facc15;">{{ day_totals[day]['dnt'] }}</td>
+            <td style="font-weight: bold; color: #34d399;">{{ day_totals[day]['tha'] }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+      <tfoot style="position: sticky; bottom: 0; background: #090d16; border-top: 2px solid #10b981; font-weight: 900;">
+        <tr>
+          <td class="sticky-col" style="color: #f87171 !important;">TỔNG</td>
+          {% for mem in members %}
+            <td style="color: #facc15;">{{ member_totals[mem]['dnt'] }}</td>
+            <td style="color: #34d399;">{{ member_totals[mem]['tha'] }}</td>
+          {% endfor %}
+          <td style="color: #facc15; font-size: 13px;">{{ total_m_dnt }}</td>
+          <td style="color: #34d399; font-size: 13px;">{{ total_m_tha }}</td>
+        </tr>
+      </tfoot>
+    </table>
+  </div>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    now = get_vn_now()
+    m = str(now.month)
+    data = load_data()
+    members = data["members"]
+    month_data = data.get("months", {}).get(m, {})
+
+    day_totals = {}
+    member_totals = {mem: {"dnt": 0, "tha": 0} for mem in members}
+    total_m_dnt = total_m_tha = 0
+
+    for d in range(1, 32):
+        d_str = str(d)
+        d_dnt = d_tha = 0
+        for mem in members:
+            rec = month_data.get(d_str, {}).get(mem, {"dnt": 0, "tha": 0})
+            d_dnt += rec.get("dnt", 0)
+            d_tha += rec.get("tha", 0)
+            member_totals[mem]["dnt"] += rec.get("dnt", 0)
+            member_totals[mem]["tha"] += rec.get("tha", 0)
+        day_totals[d] = {"dnt": d_dnt, "tha": d_tha}
+        total_m_dnt += d_dnt
+        total_m_tha += d_tha
+
+    rates = data.get("rates", {"dnt": 110, "tha": 130})
+    total_all_money = (total_m_dnt * rates["dnt"]) + (total_m_tha * rates["tha"])
+    total_all_coins = total_m_dnt + total_m_tha
+
+    return render_template_string(
+        WEB_HTML,
+        current_month=m,
+        members=members,
+        month_data=month_data,
+        day_totals=day_totals,
+        member_totals=member_totals,
+        total_m_dnt=total_m_dnt,
+        total_m_tha=total_m_tha,
+        rates=rates,
+        total_all_money=total_all_money,
+        total_all_coins=total_all_coins
+    )
+
+# ----------------------------------------------------
+# 5. KHỞI CHẠY
+# ----------------------------------------------------
+if __name__ == "__main__":
+    t_bot = threading.Thread(target=lambda: bot.infinity_polling())
+    t_bot.daemon = True
+    t_bot.start()
+
+    t_sched = threading.Thread(target=auto_scheduler_loop)
+    t_sched.daemon = True
+    t_sched.start()
+
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
