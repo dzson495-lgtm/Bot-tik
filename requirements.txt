@@ -1,0 +1,4 @@
+flask
+pyTelegramBotAPI
+requests
+redis
